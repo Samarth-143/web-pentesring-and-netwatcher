@@ -9,19 +9,21 @@ logger = logging.getLogger("phantom.database")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-_engine_kwargs = {"echo": False, "pool_pre_ping": True}
-if DATABASE_URL and "supabase.co" in DATABASE_URL:
-    _ssl_ctx = _ssl.create_default_context()
-    _ssl_ctx.check_hostname = False
-    _ssl_ctx.verify_mode = _ssl.CERT_NONE
-    _engine_kwargs["connect_args"] = {"ssl": _ssl_ctx}
+engine = None
+async_session = None
+_using_fallback = False
 
-engine = create_async_engine(DATABASE_URL, **_engine_kwargs) if DATABASE_URL else None
-async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession) if engine else None
+if DATABASE_URL:
+    _engine_kwargs = {"echo": False, "pool_pre_ping": True}
+    if "supabase.co" in DATABASE_URL:
+        _ssl_ctx = _ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = _ssl.CERT_NONE
+        _engine_kwargs["connect_args"] = {"ssl": _ssl_ctx}
+    engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
+    async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 Base = declarative_base()
-
-_db_ready = False
 
 
 async def get_db():
@@ -35,14 +37,22 @@ async def get_db():
 
 
 async def init_db():
-    global _db_ready
-    if not engine:
-        logger.warning("DATABASE_URL not set — skipping database init")
-        return
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        _db_ready = True
-        logger.info("Database connected and tables created")
-    except Exception as e:
-        logger.warning(f"Database unavailable (will retry on first request): {e}")
+    global engine, async_session, _using_fallback
+
+    if engine:
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            logger.info("Connected to PostgreSQL")
+            return
+        except Exception as e:
+            logger.warning(f"PostgreSQL unreachable: {e}")
+            logger.info("Falling back to SQLite (data will not persist across restarts)")
+
+    # SQLite fallback for HF free tier
+    _using_fallback = True
+    engine = create_async_engine("sqlite+aiosqlite:///./phantom_hf.db", echo=False)
+    async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Using SQLite fallback")
