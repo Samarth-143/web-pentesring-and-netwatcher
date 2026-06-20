@@ -1,5 +1,6 @@
 import os
 import ssl as _ssl
+import asyncpg  # noqa: F401 — ensures the asyncpg dialect is registered with SQLAlchemy
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
 from app.core.config import settings
