@@ -3,9 +3,8 @@ import ssl as _ssl
 import asyncpg  # noqa: F401 — ensures the asyncpg dialect is registered with SQLAlchemy
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
-from app.core.config import settings
 
-DATABASE_URL = settings.database_url
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://localhost:5432/phantom")
 
 _engine_kwargs = {"echo": False}
 if "supabase.co" in DATABASE_URL:
