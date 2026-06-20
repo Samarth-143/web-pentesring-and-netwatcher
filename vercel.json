@@ -1,8 +1,0 @@
-{
-  "buildCommand": "cd phantom/frontend && npm install && npm run build",
-  "outputDirectory": "phantom/frontend/dist",
-  "framework": "vite",
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
-}
