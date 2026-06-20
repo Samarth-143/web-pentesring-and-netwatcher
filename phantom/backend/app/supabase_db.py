@@ -73,10 +73,13 @@ class _Result:
 
 class ModelProxy:
     """Dict wrapper that behaves like an ORM model with attribute access."""
+    _all_proxies = []  # module-level registry
+
     def __init__(self, data: dict, model_class=None):
         object.__setattr__(self, "_data", dict(data))
         object.__setattr__(self, "_model_class", model_class)
         object.__setattr__(self, "_dirty", set())
+        ModelProxy._all_proxies.append(self)
 
     def __getattr__(self, name):
         data = object.__getattribute__(self, "_data")
@@ -86,7 +89,6 @@ class ModelProxy:
 
     def __setattr__(self, name, value):
         data = object.__getattribute__(self, "_data")
-        dirty = object.__setattr__
         data[name] = value
         object.__getattribute__(self, "_dirty").add(name)
 
@@ -159,24 +161,24 @@ def _parse_sql_where(sql_where: str) -> list:
     parts = re.split(r'\bAND\b', sql_where, flags=re.IGNORECASE)
 
     for part in parts:
-        part = part.strip().strip('()')
+        part = part.strip()
 
         # IS NULL
-        m = re.match(r'(\w+)\s+IS\s+NULL', part, re.IGNORECASE)
+        m = re.match(r'([\w.]+)\s+IS\s+NULL', part, re.IGNORECASE)
         if m:
-            filters.append(("is.null", m.group(1), None))
+            filters.append(("is.null", m.group(1).split('.')[-1], None))
             continue
 
         # IS NOT NULL
-        m = re.match(r'(\w+)\s+IS\s+NOT\s+NULL', part, re.IGNORECASE)
+        m = re.match(r'([\w.]+)\s+IS\s+NOT\s+NULL', part, re.IGNORECASE)
         if m:
-            filters.append(("not.is.null", m.group(1), None))
+            filters.append(("not.is.null", m.group(1).split('.')[-1], None))
             continue
 
         # IN (val1, val2, ...)
-        m = re.match(r'(\w+)\s+IN\s*\((.+)\)', part, re.IGNORECASE)
+        m = re.match(r"([\w.]+)\s+IN\s*\((.+)\)", part, re.IGNORECASE)
         if m:
-            col = m.group(1)
+            col = m.group(1).split('.')[-1]
             vals_str = m.group(2)
             vals = [v.strip().strip("'\"") for v in vals_str.split(',')]
             filters.append(("in", col, vals))
@@ -193,9 +195,9 @@ def _parse_sql_where(sql_where: str) -> list:
             (r'LIKE', "like"),
             (r'=', "eq"),
         ]:
-            m = re.match(rf'(\w+)\s*{op_pattern}\s*(.+)', part, re.IGNORECASE)
+            m = re.match(rf'([\w.]+)\s*{op_pattern}\s*(.+)', part, re.IGNORECASE)
             if m:
-                col = m.group(1)
+                col = m.group(1).split('.')[-1]  # strip table prefix
                 val_str = m.group(2).strip()
 
                 # Parse value
@@ -250,11 +252,14 @@ def _parse_order_from_sql(sql: str) -> list:
         for item in order_part.split(','):
             item = item.strip()
             if item.upper().endswith(' DESC'):
-                orders.append((item[:-5].strip(), True))
+                col = item[:-5].strip().split('.')[-1]
+                orders.append((col, True))
             elif item.upper().endswith(' ASC'):
-                orders.append((item[:-4].strip(), False))
+                col = item[:-4].strip().split('.')[-1]
+                orders.append((col, False))
             else:
-                orders.append((item, False))
+                col = item.split('.')[-1]
+                orders.append((col, False))
     return orders
 
 
@@ -498,8 +503,11 @@ class SupabaseSession:
                     raise
         self._pending_deletes.clear()
 
-        for obj in self._pending_updates:
+        # Process updates: scan ALL known ModelProxy objects for dirty state
+        for obj in list(ModelProxy._all_proxies):
             table = obj._get_table_name()
+            if not table:
+                continue
             data = obj._to_dict()
             pk_val = data.get("id")
             dirty = object.__getattribute__(obj, "_dirty")
@@ -514,6 +522,8 @@ class SupabaseSession:
                 except Exception as e:
                     logger.error(f"REST update {table}: {e}")
                     raise
+                dirty.clear()
+        
         self._pending_updates.clear()
 
     async def refresh(self, obj):

@@ -154,8 +154,17 @@ async def on_startup():
         scheduler.start()
         
     # Seed a default admin account if not already in the DB
-    from app.database import async_session
-    async with async_session() as db:
+    from app.database import get_db, _using_supabase_rest
+    if _using_supabase_rest:
+        from app.supabase_db import get_supabase_session
+        db = await get_supabase_session()
+    else:
+        from app.database import async_session
+        if not async_session:
+            return
+        db_cm = async_session()
+        db = await db_cm.__aenter__()
+    try:
         result = await db.execute(select(models.User).where(models.User.username == "admin"))
         if not result.scalars().first():
             admin_user = models.User(
@@ -166,6 +175,9 @@ async def on_startup():
             db.add(admin_user)
             await db.commit()
             print("Default admin user created successfully: admin / admin123")
+    finally:
+        if not _using_supabase_rest:
+            await db_cm.__aexit__(None, None, None)
 
 # Risk ranking helper
 RISK_ORDER = ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]
