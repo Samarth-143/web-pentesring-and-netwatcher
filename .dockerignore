@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.git/
+*.db
+*.env
+.env*
+dump.rdb
+__pycache__/
+*.pyc
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+# Bandit Configuration File
+# Excludes virtual environments and tests from scanning.
+
+exclude_dirs:
+  - 'venv'
+  - '.venv'
+  - 'env'
+  - 'tests'
+
+skips:
+  - 'B108' # hardcoded_tmp_directory - we explicitly use it for the daemon socket and have verified its safety where used
