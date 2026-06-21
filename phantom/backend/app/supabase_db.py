@@ -244,13 +244,15 @@ def _parse_sql_where(sql_where: str) -> list:
 
 
 def _parse_order_from_sql(sql: str) -> list:
-    """Extract ORDER BY from compiled SQL."""
+    """Extract ORDER BY from compiled SQL. Skips function-based ordering (e.g. count())."""
     orders = []
     m = re.search(r'ORDER\s+BY\s+(.+?)(?:\s+LIMIT\s|\s+OFFSET\s|$)', sql, re.IGNORECASE)
     if m:
         order_part = m.group(1)
         for item in order_part.split(','):
             item = item.strip()
+            if '(' in item:
+                continue  # skip function-based ordering (e.g. count())
             if item.upper().endswith(' DESC'):
                 col = item[:-5].strip().split('.')[-1]
                 orders.append((col, True))
@@ -540,8 +542,12 @@ class SupabaseSession:
 
     async def refresh(self, obj):
         """Re-fetch an object to get auto-generated values."""
-        table = obj._get_table_name()
-        data = obj._to_dict()
+        if isinstance(obj, ModelProxy):
+            table = obj._get_table_name()
+            data = obj._to_dict()
+        else:
+            table = getattr(obj, "__tablename__", None)
+            data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
         pk_val = data.get("id")
         if pk_val is None:
             return
@@ -553,8 +559,13 @@ class SupabaseSession:
             resp.raise_for_status()
             result = resp.json()
             if result:
-                obj_data = object.__getattribute__(obj, "_data")
-                obj_data.update(result[0])
+                if isinstance(obj, ModelProxy):
+                    obj_data = object.__getattribute__(obj, "_data")
+                    obj_data.update(result[0])
+                else:
+                    for k, v in result[0].items():
+                        if hasattr(obj, k):
+                            setattr(obj, k, v)
         except Exception as e:
             logger.error(f"REST refresh: {e}")
 
