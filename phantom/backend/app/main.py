@@ -90,7 +90,7 @@ from app.core.celery_app import CELERY_AVAILABLE
 # query parameters.
 async def _patched_ratelimiter_call(self, request: _LimiterRequest, response: _LimiterResponse):
     if not FastAPILimiter.redis:
-        raise Exception("You must call FastAPILimiter.init in startup event of fastapi!")
+        return None
     route_index = 0
     dep_index = 0
     for i, route in enumerate(request.app.routes):
