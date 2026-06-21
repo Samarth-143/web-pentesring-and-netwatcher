@@ -195,8 +195,102 @@ def get_highest_risk(risks: List[str]) -> str:
     return highest
 
 
-# Helper wrapper to automatically log execution results to SQLite DB
-async def run_and_save_scan(
+# Helper wrapper to automatically log execution results to DB
+async def _run_scan_background(
+    user_id: int,
+    module_name: str,
+    celery_task_func,
+    target: str,
+    options: Optional[dict],
+):
+    """
+    Background scan task — creates its own DB session so it survives
+    client disconnection.
+    """
+    from app.database import get_db, _using_supabase_rest
+    if _using_supabase_rest:
+        from app.supabase_db import get_supabase_session
+        db = await get_supabase_session()
+    else:
+        from app.database import async_session
+        if not async_session:
+            return
+        db = await async_session().__aenter__()
+
+    try:
+        session_rec = models.ScanSession(
+            user_id=user_id,
+            target=target,
+            status="running",
+            modules_run=[module_name]
+        )
+        db.add(session_rec)
+        await db.commit()
+        await db.refresh(session_rec)
+        session_id = session_rec.id
+
+        start_time = time.monotonic()
+        task = celery_task_func.delay(target, options)
+
+        max_wait = 900
+        elapsed = 0.0
+        while not task.ready():
+            await asyncio.sleep(0.5)
+            elapsed += 0.5
+            if elapsed >= max_wait:
+                break
+
+        if not task.ready():
+            res = {"status": "error", "message": "Task timed out", "risk": "INFO", "vulnerable": False}
+            err = "timeout"
+        elif task.state == 'FAILURE':
+            res = {"status": "error", "message": str(task.result), "risk": "INFO", "vulnerable": False}
+            err = str(task.result)
+        else:
+            res = task.result if task.result is not None else {}
+            err = None
+
+        duration = time.monotonic() - start_time
+        risk = res.get("risk", "INFO") if isinstance(res, dict) else "INFO"
+        vuln = res.get("vulnerable", False) if isinstance(res, dict) else False
+
+        result_rec = models.ScanResult(
+            session_id=session_id,
+            module_name=module_name,
+            risk_level=risk,
+            vulnerable=vuln,
+            duration_seconds=round(duration, 2),
+            result_data=res,
+            error_message=err
+        )
+        db.add(result_rec)
+
+        if vuln:
+            alert_rec = models.Alert(
+                session_id=session_id,
+                module_name=module_name,
+                severity=risk,
+                description=f"Vulnerability detected in module {module_name} on {target}"
+            )
+            db.add(alert_rec)
+
+        session_rec = await db.get(models.ScanSession, session_id)
+        if session_rec:
+            session_rec.status = "completed" if err is None else "failed"
+            session_rec.overall_risk = risk
+            session_rec.completed_at = datetime.datetime.utcnow()
+        await db.commit()
+
+        results_dict = {module_name: res} if isinstance(res, dict) else {}
+        await _auto_generate_report(db, type('User', (), {'id': user_id, 'username': 'user'})(), target, session_id, results_dict)
+    except Exception as e:
+        print(f"[ERROR] Background scan failed: {e}")
+    finally:
+        if not _using_supabase_rest:
+            pass  # session context manager handles cleanup
+
+
+def run_and_save_scan(
     db: AsyncSession,
     current_user: models.User,
     module_name: str,
@@ -205,81 +299,13 @@ async def run_and_save_scan(
     options: Optional[dict]
 ):
     """
-    Dispatch a Celery scanning task, wait for completion, persist result
-    to the database, and return the result dict.
+    Fire-and-forget: start scan as background task, return session_id immediately.
     """
-    session_rec = models.ScanSession(
-        user_id=current_user.id,
-        target=target,
-        status="running",
-        modules_run=[module_name]
+    import asyncio as _asyncio
+    _asyncio.create_task(
+        _run_scan_background(current_user.id, module_name, celery_task_func, target, options)
     )
-    db.add(session_rec)
-    await db.commit()
-    await db.refresh(session_rec)
-    session_id = session_rec.id
-
-    start_time = time.monotonic()
-
-    # All Celery tasks accept (target, options=None) — consistent signature
-    task = celery_task_func.delay(target, options)
-
-    # Poll with a 15-minute timeout to prevent hanging forever
-    max_wait = 900
-    elapsed = 0.0
-    while not task.ready():
-        await asyncio.sleep(0.5)
-        elapsed += 0.5
-        if elapsed >= max_wait:
-            break
-
-    if not task.ready():
-        res = {"status": "error", "message": "Task timed out after 15 minutes", "risk": "INFO", "vulnerable": False}
-        err = "timeout"
-    elif task.state == 'FAILURE':
-        res = {"status": "error", "message": str(task.result), "risk": "INFO", "vulnerable": False}
-        err = str(task.result)
-    else:
-        res = task.result if task.result is not None else {}
-        err = None
-
-    duration = time.monotonic() - start_time
-
-    risk = res.get("risk", "INFO") if isinstance(res, dict) else "INFO"
-    vuln = res.get("vulnerable", False) if isinstance(res, dict) else False
-
-    result_rec = models.ScanResult(
-        session_id=session_id,
-        module_name=module_name,
-        risk_level=risk,
-        vulnerable=vuln,
-        duration_seconds=round(duration, 2),
-        result_data=res,
-        error_message=err
-    )
-    db.add(result_rec)
-
-    if vuln:
-        alert_rec = models.Alert(
-            session_id=session_id,
-            module_name=module_name,
-            severity=risk,
-            description=f"Vulnerability detected in module {module_name} on {target}"
-        )
-        db.add(alert_rec)
-
-    session_rec = await db.get(models.ScanSession, session_id)
-    if session_rec:
-        session_rec.status = "completed" if err is None else "failed"
-        session_rec.overall_risk = risk
-        session_rec.completed_at = datetime.datetime.utcnow()
-    await db.commit()
-
-    # Auto-generate PDF report
-    results_dict = {module_name: res} if isinstance(res, dict) else {}
-    await _auto_generate_report(db, current_user, target, session_id, results_dict)
-
-    return res
+    return {"status": "running", "target": target, "module": module_name}
 
 
 async def _auto_generate_report(db, current_user, target, session_id, results_dict):
@@ -430,52 +456,52 @@ async def delete_user(user_id: int, db: AsyncSession = Depends(get_db), current_
 
 @app.post("/api/port-scan", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_port_scan(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "port_scanner", scanner_tasks.port_scan_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "port_scanner", scanner_tasks.port_scan_task, payload.target, payload.options)
 
 @app.post("/api/sqli-test", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_sqli_test(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "sqli_tester", scanner_tasks.sqli_test_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "sqli_tester", scanner_tasks.sqli_test_task, payload.target, payload.options)
 
 @app.post("/api/xss-detect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_xss_detect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "xss_detector", scanner_tasks.xss_detect_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "xss_detector", scanner_tasks.xss_detect_task, payload.target, payload.options)
 
 @app.post("/api/subdomain-enum", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_subdomain_enum(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "subdomain_enum", scanner_tasks.subdomain_enum_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "subdomain_enum", scanner_tasks.subdomain_enum_task, payload.target, payload.options)
 
 @app.post("/api/header-analyze", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_header_analyze(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "header_analyzer", scanner_tasks.header_analyzer_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "header_analyzer", scanner_tasks.header_analyzer_task, payload.target, payload.options)
 
 @app.post("/api/ssl-analyze", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_ssl_analyze(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "ssl_analyzer", scanner_tasks.ssl_analyzer_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "ssl_analyzer", scanner_tasks.ssl_analyzer_task, payload.target, payload.options)
 
 @app.post("/api/dir-enum", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_dir_enum(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "dir_enum", scanner_tasks.dir_enum_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "dir_enum", scanner_tasks.dir_enum_task, payload.target, payload.options)
 
 @app.post("/api/waf-detect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_waf_detect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "waf_detect", scanner_tasks.waf_detect_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "waf_detect", scanner_tasks.waf_detect_task, payload.target, payload.options)
 
 @app.post("/api/whois-lookup", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_whois_lookup(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "whois_lookup", scanner_tasks.whois_lookup_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "whois_lookup", scanner_tasks.whois_lookup_task, payload.target, payload.options)
 
 # Alias for frontend compatibility (/api/whois is called by the frontend)
 @app.post("/api/whois", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_whois_alias(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "whois_lookup", scanner_tasks.whois_lookup_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "whois_lookup", scanner_tasks.whois_lookup_task, payload.target, payload.options)
 
 @app.post("/api/dns-recon", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_dns_recon(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "dns_recon", scanner_tasks.dns_recon_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "dns_recon", scanner_tasks.dns_recon_task, payload.target, payload.options)
 
 @app.post("/api/cve-lookup", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_cve_lookup(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "cve_lookup", scanner_tasks.cve_lookup_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "cve_lookup", scanner_tasks.cve_lookup_task, payload.target, payload.options)
 
 @app.post("/api/report", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_report(
@@ -615,141 +641,139 @@ async def delete_report(
 
 @app.post("/api/csrf-detect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_csrf_detect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "csrf_detector", scanner_tasks.csrf_detector_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "csrf_detector", scanner_tasks.csrf_detector_task, payload.target, payload.options)
 
 @app.post("/api/ssrf-detect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_ssrf_detect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "ssrf_detector", scanner_tasks.ssrf_detector_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "ssrf_detector", scanner_tasks.ssrf_detector_task, payload.target, payload.options)
 
 @app.post("/api/xxe-detect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_xxe_detect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "xxe_detector", scanner_tasks.xxe_detector_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "xxe_detector", scanner_tasks.xxe_detector_task, payload.target, payload.options)
 
 @app.post("/api/auth-test", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_auth_test(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "auth_tester", scanner_tasks.auth_tester_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "auth_tester", scanner_tasks.auth_tester_task, payload.target, payload.options)
 
 @app.post("/api/open-redirect", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_open_redirect(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return await run_and_save_scan(db, current_user, "open_redirect", scanner_tasks.open_redirect_task, payload.target, payload.options)
+    return run_and_save_scan(db, current_user, "open_redirect", scanner_tasks.open_redirect_task, payload.target, payload.options)
 
 # ----------------- Orchestrated Full Scan -----------------
 
 @app.post("/api/full-scan", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def route_full_scan(payload: ScanRequest, db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    module_keys = [
-        "port_scanner", "sqli_tester", "xss_detector", "subdomain_enum",
-        "header_analyzer", "ssl_analyzer", "dir_enum", "waf_detect",
-        "whois_lookup", "dns_recon", "cve_lookup", "csrf_detector",
-        "ssrf_detector", "xxe_detector", "auth_tester", "open_redirect"
-    ]
-    
-    session_rec = models.ScanSession(
-        user_id=current_user.id,
-        target=payload.target,
-        status="running",
-        modules_run=module_keys
+    asyncio.create_task(
+        _run_full_scan_background(current_user.id, current_user.username, payload.target, payload.options)
     )
-    db.add(session_rec)
-    await db.commit()
-    await db.refresh(session_rec)
-    session_id = session_rec.id
-    
-    from app.tasks import scanner_tasks
-    tasks = [
-        scanner_tasks.port_scan_task.delay(payload.target, payload.options),
-        scanner_tasks.sqli_test_task.delay(payload.target, payload.options),
-        scanner_tasks.xss_detect_task.delay(payload.target, payload.options),
-        scanner_tasks.subdomain_enum_task.delay(payload.target, payload.options),
-        scanner_tasks.header_analyzer_task.delay(payload.target, payload.options),
-        scanner_tasks.ssl_analyzer_task.delay(payload.target, payload.options),
-        scanner_tasks.dir_enum_task.delay(payload.target, payload.options),
-        scanner_tasks.waf_detect_task.delay(payload.target, payload.options),
-        scanner_tasks.whois_lookup_task.delay(payload.target, payload.options),  # task accepts options, module ignores it
-        scanner_tasks.dns_recon_task.delay(payload.target, payload.options),       # same
-        scanner_tasks.cve_lookup_task.delay(payload.target, payload.options),
-        scanner_tasks.csrf_detector_task.delay(payload.target, payload.options),
-        scanner_tasks.ssrf_detector_task.delay(payload.target, payload.options),
-        scanner_tasks.xxe_detector_task.delay(payload.target, payload.options),
-        scanner_tasks.auth_tester_task.delay(payload.target, payload.options),
-        scanner_tasks.open_redirect_task.delay(payload.target, payload.options),
-    ]
-    
-    start_time = time.monotonic()
-    max_wait_seconds = 900  # 15 minute timeout
-    
-    while True:
-        all_done = all(t.ready() for t in tasks)
-        if all_done:
-            break
-        if time.monotonic() - start_time > max_wait_seconds:
-            break  # timeout — partial results will be collected below
-        await asyncio.sleep(0.5)
-        
-    duration = time.monotonic() - start_time
-    
-    # Collect results — handle SUCCESS, FAILURE, and timed-out tasks
-    results = []
-    for t in tasks:
-        if not t.ready():
-            results.append(Exception("Task timed out"))
-        elif t.state == 'FAILURE':
-            results.append(Exception(str(t.result)))
-        else:
-            results.append(t.result)
-    
-    aggregated = {}
-    findings_risks = []
-    
-    for key, res in zip(module_keys, results):
-        result_rec = models.ScanResult(
-            session_id=session_id,
-            module_name=key,
-        )
-        if isinstance(res, Exception):
-            result_rec.risk_level = "INFO"
-            result_rec.vulnerable = False
-            result_rec.error_message = str(res)
-            aggregated[key] = {"status": "error", "message": str(res)}
-        else:
-            risk = res.get("risk", "INFO") if isinstance(res, dict) else "INFO"
-            vuln = res.get("vulnerable", False) if isinstance(res, dict) else False
-            result_rec.risk_level = risk
-            result_rec.vulnerable = vuln
-            result_rec.result_data = res
-            findings_risks.append(risk)
-            aggregated[key] = res
-            
-            if vuln:
-                alert_rec = models.Alert(
-                    session_id=session_id,
-                    module_name=key,
-                    severity=risk,
-                    description=f"Vulnerability detected in {key} on {payload.target}"
-                )
-                db.add(alert_rec)
-        db.add(result_rec)
-        
-    overall_risk = get_highest_risk(findings_risks)
-    session_rec = await db.get(models.ScanSession, session_id)
-    if session_rec:
-        session_rec.status = "completed"
-        session_rec.overall_risk = overall_risk
-        session_rec.completed_at = datetime.datetime.utcnow()
-        
-    await db.commit()
+    return {"status": "running", "target": payload.target, "module": "full_scan"}
 
-    # Auto-generate PDF report
-    await _auto_generate_report(db, current_user, payload.target, session_id, aggregated)
-    
-    return {
-        "session_id": session_id,
-        "target": payload.target,
-        "status": "completed",
-        "overall_risk": overall_risk,
-        "duration_seconds": round(duration, 2),
-        "results": aggregated
-    }
+
+async def _run_full_scan_background(user_id: int, username: str, target: str, options: Optional[dict]):
+    """Full scan as background task with its own DB session."""
+    from app.database import _using_supabase_rest
+    if _using_supabase_rest:
+        from app.supabase_db import get_supabase_session
+        db = await get_supabase_session()
+    else:
+        from app.database import async_session
+        if not async_session:
+            return
+        db = await async_session().__aenter__()
+
+    try:
+        module_keys = [
+            "port_scanner", "sqli_tester", "xss_detector", "subdomain_enum",
+            "header_analyzer", "ssl_analyzer", "dir_enum", "waf_detect",
+            "whois_lookup", "dns_recon", "cve_lookup", "csrf_detector",
+            "ssrf_detector", "xxe_detector", "auth_tester", "open_redirect"
+        ]
+
+        session_rec = models.ScanSession(
+            user_id=user_id,
+            target=target,
+            status="running",
+            modules_run=module_keys
+        )
+        db.add(session_rec)
+        await db.commit()
+        await db.refresh(session_rec)
+        session_id = session_rec.id
+
+        from app.tasks import scanner_tasks
+        tasks = [
+            scanner_tasks.port_scan_task.delay(target, options),
+            scanner_tasks.sqli_test_task.delay(target, options),
+            scanner_tasks.xss_detect_task.delay(target, options),
+            scanner_tasks.subdomain_enum_task.delay(target, options),
+            scanner_tasks.header_analyzer_task.delay(target, options),
+            scanner_tasks.ssl_analyzer_task.delay(target, options),
+            scanner_tasks.dir_enum_task.delay(target, options),
+            scanner_tasks.waf_detect_task.delay(target, options),
+            scanner_tasks.whois_lookup_task.delay(target, options),
+            scanner_tasks.dns_recon_task.delay(target, options),
+            scanner_tasks.cve_lookup_task.delay(target, options),
+            scanner_tasks.csrf_detector_task.delay(target, options),
+            scanner_tasks.ssrf_detector_task.delay(target, options),
+            scanner_tasks.xxe_detector_task.delay(target, options),
+            scanner_tasks.auth_tester_task.delay(target, options),
+            scanner_tasks.open_redirect_task.delay(target, options),
+        ]
+
+        start_time = time.monotonic()
+        while True:
+            if all(t.ready() for t in tasks):
+                break
+            if time.monotonic() - start_time > 900:
+                break
+            await asyncio.sleep(0.5)
+
+        results = []
+        for t in tasks:
+            if not t.ready():
+                results.append(Exception("Task timed out"))
+            elif t.state == 'FAILURE':
+                results.append(Exception(str(t.result)))
+            else:
+                results.append(t.result)
+
+        aggregated = {}
+        findings_risks = []
+        for key, res in zip(module_keys, results):
+            result_rec = models.ScanResult(session_id=session_id, module_name=key)
+            if isinstance(res, Exception):
+                result_rec.risk_level = "INFO"
+                result_rec.vulnerable = False
+                result_rec.error_message = str(res)
+                aggregated[key] = {"status": "error", "message": str(res)}
+            else:
+                risk = res.get("risk", "INFO") if isinstance(res, dict) else "INFO"
+                vuln = res.get("vulnerable", False) if isinstance(res, dict) else False
+                result_rec.risk_level = risk
+                result_rec.vulnerable = vuln
+                result_rec.result_data = res
+                findings_risks.append(risk)
+                aggregated[key] = res
+                if vuln:
+                    alert_rec = models.Alert(
+                        session_id=session_id, module_name=key,
+                        severity=risk, description=f"Vulnerability detected in {key} on {target}"
+                    )
+                    db.add(alert_rec)
+            db.add(result_rec)
+
+        overall_risk = get_highest_risk(findings_risks)
+        session_rec = await db.get(models.ScanSession, session_id)
+        if session_rec:
+            session_rec.status = "completed"
+            session_rec.overall_risk = overall_risk
+            session_rec.completed_at = datetime.datetime.utcnow()
+        await db.commit()
+
+        user_proxy = type('User', (), {'id': user_id, 'username': username})()
+        await _auto_generate_report(db, user_proxy, target, session_id, aggregated)
+    except Exception as e:
+        print(f"[ERROR] Background full-scan failed: {e}")
 
 # ----------------- Database and History APIS -----------------
 

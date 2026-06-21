@@ -97,6 +97,29 @@ function Dashboard({ alerts, setAlerts, stats, loadStats }) {
         });
         resData = { results: { [mod]: raw } };
       }
+
+      // If backend returned "running" (fire-and-forget), poll history for results
+      if (resData && resData.status === 'running') {
+        let attempts = 0;
+        const maxAttempts = 180;
+        while (attempts < maxAttempts) {
+          await new Promise(r => setTimeout(r, 2000));
+          attempts++;
+          try {
+            const history = await fetchAuth('/api/history?limit=1');
+            const latest = history.sessions?.[0];
+            if (latest && latest.target === scanTarget && latest.status === 'completed') {
+              const detail = await fetchAuth(`/api/history/${latest.id}`);
+              const combined = {};
+              (detail.results || []).forEach(r => {
+                combined[r.module_name] = r.result_data || { risk: r.risk_level, vulnerable: r.vulnerable };
+              });
+              resData = { session_id: latest.id, results: combined };
+              break;
+            }
+          } catch (e) { /* retry */ }
+        }
+      }
       
       setScanDuration(Math.round((performance.now() - start) / 1000));
       setScanResult(resData);
