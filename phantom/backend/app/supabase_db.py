@@ -499,13 +499,13 @@ class SupabaseSession:
         self._pending_inserts.clear()
 
         for obj in self._pending_deletes:
-        if isinstance(obj, ModelProxy):
-            table = obj._get_table_name()
-            data = obj._to_dict()
-        else:
-            table = getattr(obj, "__tablename__", None)
-            data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
-        pk_val = data.get("id")
+            if isinstance(obj, ModelProxy):
+                table = obj._get_table_name()
+                data = obj._to_dict()
+            else:
+                table = getattr(obj, "__tablename__", None)
+                data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+            pk_val = data.get("id")
             if pk_val is not None:
                 try:
                     await self._client.delete(f"/rest/v1/{table}", params={"id": f"eq.{pk_val}"})
