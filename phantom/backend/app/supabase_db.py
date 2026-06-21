@@ -429,11 +429,11 @@ class SupabaseSession:
             logger.error(f"REST get error: {e}")
             raise
 
-    async def add(self, obj):
+    def add(self, obj):
         """Stage an insert."""
         self._pending_inserts.append(obj)
 
-    async def delete(self, obj):
+    def delete(self, obj):
         """Stage a delete with manual cascade."""
         table = obj._get_table_name()
         data = obj._to_dict()
