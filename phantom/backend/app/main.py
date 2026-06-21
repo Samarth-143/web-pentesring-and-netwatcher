@@ -467,7 +467,7 @@ async def route_report(
     if pdf_data_b64:
         try:
             pdf_bytes = base64.b64decode(pdf_data_b64)
-            storage_path = await storage.upload_pdf(current_user.id, filename, pdf_bytes)
+            storage_path = await storage.upload_pdf(current_user.username, filename, pdf_bytes)
 
             report_rec = models.ScanReport(
                 user_id=current_user.id,

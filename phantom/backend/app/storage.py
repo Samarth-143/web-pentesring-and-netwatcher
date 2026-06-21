@@ -14,9 +14,9 @@ def _headers():
     }
 
 
-async def upload_pdf(user_id: int, filename: str, pdf_bytes: bytes) -> str:
-    """Upload a PDF to Supabase Storage under {user_id}/{filename}. Returns the storage path."""
-    path = f"{user_id}/{filename}"
+async def upload_pdf(username: str, filename: str, pdf_bytes: bytes) -> str:
+    """Upload a PDF to Supabase Storage under {username}/{filename}. Returns the storage path."""
+    path = f"{username}/{filename}"
     url = f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{path}"
 
     async with httpx.AsyncClient() as client:
@@ -66,7 +66,7 @@ async def delete_file(storage_path: str) -> bool:
         return resp.status_code in (200, 204)
 
 
-async def list_user_files(user_id: int) -> list[dict]:
+async def list_user_files(username: str) -> list[dict]:
     """List all files in a user's folder. Returns list of {name, id, metadata}."""
     url = f"{SUPABASE_URL}/storage/v1/object/list/{BUCKET}"
 
@@ -74,7 +74,7 @@ async def list_user_files(user_id: int) -> list[dict]:
         resp = await client.post(
             url,
             headers=_headers(),
-            json={"prefix": f"{user_id}/", "limit": 100, "offset": 0, "sortBy": {"column": "created_at", "order": "desc"}},
+            json={"prefix": f"{username}/", "limit": 100, "offset": 0, "sortBy": {"column": "created_at", "order": "desc"}},
             timeout=15,
         )
         if resp.status_code != 200:
