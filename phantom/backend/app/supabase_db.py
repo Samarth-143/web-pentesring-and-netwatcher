@@ -431,7 +431,14 @@ class SupabaseSession:
 
     def add(self, obj):
         """Stage an insert."""
-        self._pending_inserts.append(obj)
+        if isinstance(obj, ModelProxy):
+            self._pending_inserts.append(obj)
+        else:
+            # Convert SQLAlchemy model to ModelProxy
+            table_name = getattr(obj, "__tablename__", None)
+            data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+            proxy = ModelProxy(data, type(obj))
+            self._pending_inserts.append(proxy)
 
     async def delete(self, obj):
         """Stage a delete with manual cascade."""
@@ -492,9 +499,13 @@ class SupabaseSession:
         self._pending_inserts.clear()
 
         for obj in self._pending_deletes:
+        if isinstance(obj, ModelProxy):
             table = obj._get_table_name()
             data = obj._to_dict()
-            pk_val = data.get("id")
+        else:
+            table = getattr(obj, "__tablename__", None)
+            data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+        pk_val = data.get("id")
             if pk_val is not None:
                 try:
                     await self._client.delete(f"/rest/v1/{table}", params={"id": f"eq.{pk_val}"})
