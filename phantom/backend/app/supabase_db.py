@@ -478,7 +478,8 @@ class SupabaseSession:
         """Flush all pending operations via REST."""
         for obj in self._pending_inserts:
             table = obj._get_table_name()
-            data = obj._to_dict()
+            # Strip None values so Supabase uses column defaults (e.g. auto-increment id)
+            data = {k: v for k, v in obj._to_dict().items() if v is not None}
             try:
                 resp = await self._client.post(
                     f"/rest/v1/{table}",
