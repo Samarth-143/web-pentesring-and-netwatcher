@@ -91,26 +91,29 @@ from app.core.celery_app import CELERY_AVAILABLE
 async def _patched_ratelimiter_call(self, request: _LimiterRequest, response: _LimiterResponse):
     if not FastAPILimiter.redis:
         return None
-    route_index = 0
-    dep_index = 0
-    for i, route in enumerate(request.app.routes):
-        if getattr(route, "path", None) == request.scope["path"] and request.method in (getattr(route, "methods", None) or set()):
-            route_index = i
-            for j, dependency in enumerate(getattr(route, "dependencies", []) or []):
-                if self is dependency.dependency:
-                    dep_index = j
-                    break
-    identifier = self.identifier or FastAPILimiter.identifier
-    callback = self.callback or FastAPILimiter.http_callback
-    rate_key = await identifier(request)
-    key = f"{FastAPILimiter.prefix}:{rate_key}:{route_index}:{dep_index}"
     try:
-        pexpire = await self._check(key)
-    except _pyredis.exceptions.NoScriptError:
-        FastAPILimiter.lua_sha = await FastAPILimiter.redis.script_load(FastAPILimiter.lua_script)
-        pexpire = await self._check(key)
-    if pexpire != 0:
-        return await callback(request, response, pexpire)
+        route_index = 0
+        dep_index = 0
+        for i, route in enumerate(request.app.routes):
+            if getattr(route, "path", None) == request.scope["path"] and request.method in (getattr(route, "methods", None) or set()):
+                route_index = i
+                for j, dependency in enumerate(getattr(route, "dependencies", []) or []):
+                    if self is dependency.dependency:
+                        dep_index = j
+                        break
+        identifier = self.identifier or FastAPILimiter.identifier
+        callback = self.callback or FastAPILimiter.http_callback
+        rate_key = await identifier(request)
+        key = f"{FastAPILimiter.prefix}:{rate_key}:{route_index}:{dep_index}"
+        try:
+            pexpire = await self._check(key)
+        except _pyredis.exceptions.NoScriptError:
+            FastAPILimiter.lua_sha = await FastAPILimiter.redis.script_load(FastAPILimiter.lua_script)
+            pexpire = await self._check(key)
+        if pexpire != 0:
+            return await callback(request, response, pexpire)
+    except Exception:
+        return None
 
 RateLimiter.__call__ = _patched_ratelimiter_call
 
@@ -143,6 +146,7 @@ async def on_startup():
         redis_conn = redis_async.from_url(redis_url, encoding="utf8", decode_responses=True)
         await FastAPILimiter.init(redis_conn, identifier=rate_limit_identifier)
     except Exception as e:
+        FastAPILimiter.redis = None
         print(f"[WARN] Rate limiter disabled (Redis unavailable): {e}")
 
     # Initialize database and tables
