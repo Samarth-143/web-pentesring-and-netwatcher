@@ -433,7 +433,7 @@ class SupabaseSession:
         """Stage an insert."""
         self._pending_inserts.append(obj)
 
-    def delete(self, obj):
+    async def delete(self, obj):
         """Stage a delete with manual cascade."""
         table = obj._get_table_name()
         data = obj._to_dict()
