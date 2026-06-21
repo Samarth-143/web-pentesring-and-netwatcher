@@ -274,7 +274,42 @@ async def run_and_save_scan(
         session_rec.overall_risk = risk
         session_rec.completed_at = datetime.datetime.utcnow()
     await db.commit()
+
+    # Auto-generate PDF report
+    results_dict = {module_name: res} if isinstance(res, dict) else {}
+    await _auto_generate_report(db, current_user, target, session_id, results_dict)
+
     return res
+
+
+async def _auto_generate_report(db, current_user, target, session_id, results_dict):
+    """Auto-generate PDF report after a scan and save to storage + DB."""
+    try:
+        import base64
+        import report_gen as _report_gen
+        payload_opts = {"results": results_dict}
+        result = await _report_gen.generate_report(target, payload_opts)
+        if "error" in result:
+            return
+        pdf_data_b64 = result.get("pdf_data", "")
+        if not pdf_data_b64:
+            return
+        filename = result.get("filename", "report.pdf")
+        overall_risk = result.get("overall_risk", "INFO")
+        pdf_bytes = base64.b64decode(pdf_data_b64)
+        storage_path = await storage.upload_pdf(current_user.username, filename, pdf_bytes)
+        report_rec = models.ScanReport(
+            user_id=current_user.id,
+            session_id=session_id,
+            filename=filename,
+            storage_path=storage_path,
+            target=target,
+            overall_risk=overall_risk,
+        )
+        db.add(report_rec)
+        await db.commit()
+    except Exception as e:
+        print(f"[WARN] Auto-report generation failed: {e}")
 
 
 @app.get("/")
@@ -703,6 +738,9 @@ async def route_full_scan(payload: ScanRequest, db: AsyncSession = Depends(get_d
         session_rec.completed_at = datetime.datetime.utcnow()
         
     await db.commit()
+
+    # Auto-generate PDF report
+    await _auto_generate_report(db, current_user, payload.target, session_id, aggregated)
     
     return {
         "session_id": session_id,
